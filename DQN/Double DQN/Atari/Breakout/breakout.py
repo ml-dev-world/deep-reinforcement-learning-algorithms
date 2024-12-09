@@ -492,7 +492,7 @@ if __name__ == "__main__":
 
                             # No need to calculate gradients for the target network
                             with torch.no_grad():
-                                # DOUBLE Q-LEARNING
+                                # Double Q-Learning
                                 next_actions = q_network(data.next_state).argmax(
                                     dim=1, keepdim=True
                                 )
