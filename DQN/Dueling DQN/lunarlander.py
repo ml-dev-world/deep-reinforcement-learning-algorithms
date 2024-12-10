@@ -90,8 +90,8 @@ class Args:
     # Exploration Settings
     start_epsilon: float = 1.0
     end_epsilon: float = 0.01
-    decay_rate: int = 200
-    exploration_fraction: float = 0.75
+    # decay_rate: int = 200
+    exploration_fraction: float = 0.5
 
     # Replay Buffer Settings
     buffer_size: int = 100000
@@ -100,16 +100,16 @@ class Args:
     beta: float = 0.4
 
     # Training Settings
-    total_timesteps: int = 10000
+    total_timesteps: int = 5000
     gamma: float = 0.99
     tau: float = 1e-2
-    train_frequency: int = 2
+    train_frequency: int = 4
     target_update_frequency: int = 1
     learning_start: int = 100
 
     # Model Settings
-    batch_size: int = 256
-    learning_rate: float = 1e-4
+    batch_size: int = 64
+    learning_rate: float = 5e-4
     clip_grad_norm: float = 10.0
     weight_decay: float = 0.0
     gradient_steps: int = 1
@@ -120,7 +120,7 @@ class Args:
     save_model: bool = True
     model_dir: str = "models"
     model_save_frequency: int = 10000
-    log_interval: int = 500
+    log_interval: int = 250
 
 
 def log_args(args: Args):
@@ -150,7 +150,6 @@ def make_env(env_id, seed, capture_video, run_name):
             env,
             video_folder=f"videos/{run_name}",
             episode_trigger=lambda x: (x + 1) % 100 == 0,
-            fps=30,
         )
 
     # Add RecordEpisodeStatistics wrapper
@@ -323,54 +322,7 @@ class PrioritizedReplayBuffer:
         return self.buffer_size if self.full else self.pos
 
 
-class NoisyLinear(nn.Module):
-    def __init__(self, in_features, out_features, sigma_init=0.5):
-        super(NoisyLinear, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-
-        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
-        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
-
-        self.bias_mu = nn.Parameter(torch.empty(out_features))
-        self.bias_sigma = nn.Parameter(torch.empty(out_features))
-
-        self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
-        self.register_buffer("bias_epsilon", torch.empty(out_features))
-
-        self.reset_parameters()
-        self.reset_noise()
-
-    def reset_parameters(self):
-        bound = 1 / self.in_features**0.5
-        # Initialization for Mu
-        nn.init.uniform_(self.weight_mu, -bound, bound)
-        nn.init.uniform_(self.bias_mu, -bound, bound)
-
-        # Initialization for Sigma
-        nn.init.constant_(self.weight_sigma, 0.5 / self.in_features**0.5)
-        nn.init.constant_(self.bias_sigma, 0.5 / self.in_features**0.5)
-
-    def reset_noise(self):
-        # Generate random noise using factorized Gaussian noise
-        def scale_noise(size):
-            noise = torch.randn(size)
-            return noise.sign() * torch.sqrt(noise.abs())
-
-        self.weight_epsilon.copy_(scale_noise((self.out_features, self.in_features)))
-        self.bias_epsilon.copy_(scale_noise(self.out_features))
-
-    def forward(self, x):
-        if self.training:
-            weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
-            bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
-        else:
-            weight = self.weight_mu
-            bias = self.bias_mu
-        return torch.nn.functional.linear(x, weight, bias)
-
-
-class NoisyQNetwork(nn.Module):
+class QNetwork(nn.Module):
     def __init__(self, env: gym.Env, linear1_units=256, linear2_units=128):
         super().__init__()
         state_size = np.array(env.observation_space.shape).prod()
@@ -380,20 +332,22 @@ class NoisyQNetwork(nn.Module):
         self.feature_layer = nn.Sequential(
             nn.Linear(state_size, linear1_units),
             nn.LeakyReLU(),
+            nn.Linear(linear1_units, linear2_units),
+            nn.LeakyReLU(),
         )
 
         # Advantage layer
         self.advantage_layer = nn.Sequential(
-            NoisyLinear(linear1_units, linear2_units),
+            nn.Linear(linear2_units, linear2_units),
             nn.LeakyReLU(),
-            NoisyLinear(linear2_units, action_size),  # action_size output
+            nn.Linear(linear2_units, action_size),  # action_size output
         )
 
         # Value layer
         self.value_layer = nn.Sequential(
-            NoisyLinear(linear1_units, linear2_units),
+            nn.Linear(linear2_units, linear2_units),
             nn.LeakyReLU(),
-            NoisyLinear(linear2_units, 1),  # Scalar output
+            nn.Linear(linear2_units, 1),  # Scalar output
         )
 
     def forward(self, x):
@@ -404,12 +358,6 @@ class NoisyQNetwork(nn.Module):
         # Combine value and advantage to form Q
         q = value + (advantage - advantage.mean(dim=-1, keepdim=True))
         return q
-
-    def reset_noise(self):
-        # Reset noise in all noisy layers
-        for module in self.modules():
-            if isinstance(module, NoisyLinear):
-                module.reset_noise()
 
 
 class ModelMetrics:
@@ -480,9 +428,8 @@ def initialize_environment(env_id: str, seed: int, capture_video: bool, run_name
 
 
 def initialize_q_networks(env: gym.Env, device: torch.device):
-    q_network = NoisyQNetwork(env=env).to(device)
-    target_network = NoisyQNetwork(env=env).to(device)
-    target_network.eval()
+    q_network = QNetwork(env=env).to(device)
+    target_network = QNetwork(env=env).to(device)
     target_network.load_state_dict(
         q_network.state_dict()
     )  # Sync target network with Q-network
@@ -608,6 +555,14 @@ if __name__ == "__main__":
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
         ) as pbar:
             for global_step in pbar:
+                # Update epsilon using linear schedule
+                epsilon = linear_schedule(
+                    args.start_epsilon,
+                    args.end_epsilon,
+                    args.exploration_fraction * args.total_timesteps,
+                    global_step,
+                )
+
                 # Initialize stats for the current episode
                 current_episode_reward = 0
                 current_episode_length = 0
@@ -617,8 +572,14 @@ if __name__ == "__main__":
                 state = torch.tensor(state, dtype=torch.float32, device=device)
 
                 while True:
-                    q_values = q_network(state.unsqueeze(0))
-                    action = torch.argmax(q_values).cpu().numpy()
+                    # Choose action: Exploration vs. Exploitation
+                    if np.random.random() < epsilon:
+                        action = env.action_space.sample()
+                        exploration_actions += 1
+                    else:
+                        q_values = q_network(state.unsqueeze(0))
+                        action = torch.argmax(q_values).cpu().numpy()
+                        exploitation_actions += 1
 
                     # Take a step in the environment
                     next_state, reward, termination, truncation, info = env.step(action)
@@ -628,6 +589,9 @@ if __name__ == "__main__":
                     # Handle truncation for final observations
                     if "final_observation" in info:
                         real_next_state = info["final_observation"]
+
+                    # Clip rewards for stability
+                    # reward = np.clip(reward, -1, 1)
 
                     # Update episode statistics
                     current_episode_reward += reward
@@ -719,10 +683,6 @@ if __name__ == "__main__":
                     # Update the priorities in Tree
                     replay_buffer.update_priorities(tree_idxs, td_error)
 
-                    # Reset Network
-                    q_network.reset_noise()
-                    target_network.reset_noise()
-
                     # Update target network periodically
                     if global_step % args.target_update_frequency == 0:
                         target_network_updates += 1
@@ -746,6 +706,7 @@ if __name__ == "__main__":
                         table_data = [
                             ["General Info", ""],
                             ["  Step", global_step],
+                            ["  Epsilon", f"{epsilon:.4f}"],
                             ["  Learning Rate", f"{current_lr:.7f}"],
                             ["  Avg Loss", f"{avg_loss: .7f}"],
                             ["Performance Metrics", ""],
@@ -768,6 +729,13 @@ if __name__ == "__main__":
                             ["  Target Network Updates", target_network_updates],
                             ["Replay Buffer", ""],
                             ["  Replay Buffer Size", replay_buffer.size()],
+                            ["Action Statistics", ""],
+                            ["  Exploration Actions", exploration_actions],
+                            ["  Exploitation Actions", exploitation_actions],
+                            [
+                                "  Exploration Ratio",
+                                f"{exploration_actions / (exploration_actions + exploitation_actions):.2%}",
+                            ],
                             ["Episode Info", ""],
                             ["  Episodes Completed", len(episode_rewards)],
                         ]
